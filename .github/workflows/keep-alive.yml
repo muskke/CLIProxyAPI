@@ -1,0 +1,28 @@
+name: Node Keep Alive
+
+on:
+  schedule:
+    - cron: '*/10 * * * *' # 每10分钟执行一次
+  workflow_dispatch: # 允许手动触发
+
+permissions:
+  actions: write # 允许删除 workflow 运行记录
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 唤醒 Render 服务
+        run: |
+          # 使用 HEAD 请求 /healthz 接口，更轻量且针对性强
+          # --fail 确保非 2xx 响应时报错，-I 仅获取 Header
+          curl -s -I --fail https://cliproxyapi.chaos-meme.cn/healthz || curl -s -I --fail https://cliproxyapi.chaos-meme.cn/
+
+      - name: 清理旧的运行记录
+        run: |
+          # 使用 GitHub CLI 清理旧记录，保留最近 3 次
+          # 获取当前 workflow 的运行记录 ID，跳过前 3 个最新的，删除其余的
+          gh run list --workflow "${{ github.workflow }}" --limit 100 --json databaseId \
+            --jq '.[3:] | .[].databaseId' | xargs -I {} gh run delete {}
+        env:
+          GH_TOKEN: ${{ github.token }}
