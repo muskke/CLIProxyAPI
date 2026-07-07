@@ -1,47 +1,129 @@
 name: Upstream Sync
 
+# 让 Actions 页面里的运行记录显示得更清楚
+run-name: Sync upstream to ${{ github.ref_name }}
+
+# 防止定时任务和手动任务同时运行，避免 rebase/push 互相冲突
+concurrency:
+  group: upstream-sync-${{ github.ref }}
+  cancel-in-progress: false
+
+# 使用引号包住 "on"，避免某些 YAML 编辑器把 on 误识别成布尔值
+"on":
+  # 每天 UTC 00:00 自动同步一次
+  schedule:
+    - cron: "0 0 * * *"
+
+  # 允许在 GitHub Actions 页面手动点击 Run workflow 触发
+  workflow_dispatch:
+
+# GITHUB_TOKEN 的权限声明
+# 注意：真正 push 时下面会使用 secrets.SYNC_TOKEN，而不是默认 GITHUB_TOKEN
 permissions:
   contents: write
   actions: write
-
-on:
-  schedule:
-    - cron: "0 0 * * *" # every day
-  workflow_dispatch:
 
 jobs:
   sync_latest_from_upstream:
     name: Sync latest commits from upstream repo
     runs-on: ubuntu-latest
+
+    # 只在 fork 仓库运行，防止在非 fork 仓库误执行
     if: ${{ github.event.repository.fork }}
 
     steps:
+      - name: Check SYNC_TOKEN
+        env:
+          SYNC_TOKEN: ${{ secrets.SYNC_TOKEN }}
+        run: |
+          # 检查是否已经配置 PAT
+          # SYNC_TOKEN 需要具备 Contents: write 和 Workflows: write 权限
+          if [ -z "$SYNC_TOKEN" ]; then
+            echo "❌ Missing repository secret: SYNC_TOKEN"
+            echo "Please create a PAT with Contents write and Workflows write permissions,"
+            echo "then add it to Settings > Secrets and variables > Actions as SYNC_TOKEN."
+            exit 1
+          fi
+
       - name: Checkout target repo
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0        # 获取完整历史，便于 rebase
-          token: ${{ secrets.GITHUB_TOKEN }}
+          # 获取完整历史，rebase 必须使用完整提交历史
+          fetch-depth: 0
+
+          # 使用 PAT，而不是默认 GITHUB_TOKEN
+          # 这样才能 push 修改 .github/workflows/*.yml
+          token: ${{ secrets.SYNC_TOKEN }}
 
       - name: Sync upstream changes with rebase
+        env:
+          # 防止 git rebase --continue 时打开编辑器导致卡住
+          GIT_EDITOR: "true"
         run: |
-          # 【新增】配置 Git 用户身份信息，防止 rebase 报错
+          set -e
+
+          # 配置 Git 用户身份，防止 rebase / commit 过程报错
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          
-          # 添加上游 remote（已存在则忽略）
+
+          # 添加上游仓库 remote；如果已存在则忽略
           git remote add upstream https://github.com/router-for-me/CLIProxyAPI.git || true
-          
-          # 获取上游最新提交
+
+          # 获取上游 main 分支最新提交
           git fetch upstream main
-          
-          # 切换分支并 rebase（线性同步，无 Merge commit）
+
+          # 确保当前位于 main 分支
           git checkout main
-          git rebase upstream/main
-          
-          # 安全推送（仅在无冲突时覆盖）
+
+          # 使用 rebase 同步上游，保持提交历史线性，不生成 merge commit
+          if ! git rebase upstream/main; then
+            echo "⚠️ Rebase conflict detected"
+
+            # 列出所有冲突文件
+            conflicts="$(git diff --name-only --diff-filter=U)"
+            echo "Conflicted files:"
+            echo "$conflicts"
+
+            # 只自动处理 sync.yml 自身的冲突
+            # 其他文件冲突不自动处理，避免误覆盖代码
+            unexpected_conflicts="$(echo "$conflicts" | grep -v '^.github/workflows/sync.yml$' || true)"
+
+            if [ -n "$unexpected_conflicts" ]; then
+              echo "❌ Unexpected conflicts found:"
+              echo "$unexpected_conflicts"
+              echo "Manual resolution is required."
+              git status
+              git rebase --abort
+              exit 1
+            fi
+
+            if echo "$conflicts" | grep -qx ".github/workflows/sync.yml"; then
+              echo "Auto-resolving .github/workflows/sync.yml by keeping fork version"
+
+              # 注意：
+              # 在 git rebase 过程中：
+              # --ours   = upstream/main 的版本
+              # --theirs = 当前 fork 正在 replay 的提交版本
+              #
+              # 这里选择 --theirs，表示保留你 fork 中自定义的 sync.yml
+              git checkout --theirs -- .github/workflows/sync.yml
+              git add .github/workflows/sync.yml
+
+              # 继续 rebase
+              git rebase --continue
+            else
+              echo "❌ Rebase failed but no supported conflict was found."
+              git status
+              git rebase --abort
+              exit 1
+            fi
+          fi
+
+          # 将同步后的 main 强制安全推送回 fork
+          # --force-with-lease 比 --force 安全，避免覆盖远端新的未知提交
           git push origin main --force-with-lease
-          
-          echo "✅ Upstream sync completed with rebase (no merge commits)"
+
+          echo "✅ Upstream sync completed with rebase"
 
       - name: Sync check
         if: failure()
@@ -53,20 +135,30 @@ jobs:
       - name: Delete old workflow runs
         uses: actions/github-script@v7
         with:
+          # 使用同一个 PAT 来删除旧的 workflow runs
+          github-token: ${{ secrets.SYNC_TOKEN }}
           script: |
+            // 只保留最近 5 条历史记录，避免 Actions 记录太多
             const response = await github.rest.actions.listWorkflowRuns({
               owner: context.repo.owner,
               repo: context.repo.repo,
               workflow_id: 'sync.yml',
               per_page: 100
             });
+
             const runs = response.data.workflow_runs;
-            const runsToDelete = runs.filter(run => run.id !== context.runId).slice(5);
+
+            // 不删除当前正在运行的这条记录
+            const runsToDelete = runs
+              .filter(run => run.id !== context.runId)
+              .slice(5);
+
             for (const run of runsToDelete) {
               await github.rest.actions.deleteWorkflowRun({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
                 run_id: run.id
               });
+
               console.log(`Deleted run ${run.id}`);
             }
